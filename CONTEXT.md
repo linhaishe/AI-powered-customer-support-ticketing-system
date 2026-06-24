@@ -93,3 +93,35 @@ Draft direct acceptance rate is calculated as `accepted / viewed reply drafts`.
 The share of viewed AI suggestions that agents reported as inaccurate, unsafe, unsupported, or otherwise unusable.
 
 AI negative feedback rate is calculated as `reported-inaccurate / viewed AI suggestions`.
+
+## RBAC
+
+Role-based access control. RBAC defines which actions a role is allowed to perform, such as viewing a service case, editing a reply draft, reviewing high-risk cases, or managing knowledge articles.
+
+## Resource Scope
+
+The set of resources an actor is allowed to access, such as assigned service cases, team queues, merchant-owned cases, regions, or knowledge domains.
+
+## Field-Level Masking
+
+The rule set that decides whether a field is returned as clear text, masked text, summarized text, or omitted entirely.
+
+Field-level masking is applied before data is returned to the frontend or included in an AI context snapshot.
+
+## Field Visibility Level
+
+The visibility form applied to a data field after authorization and masking.
+
+Allowed visibility levels are clear, masked, summary, aggregate, and omitted.
+
+- Clear means the actor can see the original field value.
+- Masked means the actor can see a partially redacted value.
+- Summary means the actor can see a natural-language summary without the raw value.
+- Aggregate means the actor can see only grouped or statistical information.
+- Omitted means the field is not returned.
+
+## AIServiceAccount
+
+A service account used by AI jobs.
+
+The AI service account can read only whitelisted and masked context snapshots and can write AI interactions and audit events. It cannot directly access production data with broad administrator privileges.

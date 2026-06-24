@@ -667,13 +667,106 @@ AI 负反馈率 = reported_inaccurate / viewed AI suggestions
 - 处理闭环时长：`resolvedAt - caseCreatedAt`
 - reopen 后跟进时长：`followUpResolvedAt - reopenedAt`
 
-## 16. 安全与合规设计
+## 16. 安全、权限与合规边界
 
-### 数据安全
+### AI 数据访问边界
 
-- 模型上下文只传必要字段。
-- 消费者敏感信息脱敏。
-- AI 交互记录保存上下文快照和输入摘要，不保存无关个人隐私。
+AI 只能访问经过授权、脱敏和字段裁剪后的业务上下文。模型上下文由服务端白名单构造，前端不能直接决定向模型传入哪些字段。
+
+禁止传入 AI 的内容：
+
+- 生产密钥、API Token、数据库连接串和内部系统凭证。
+- 完整消费者地址、手机号、邮箱、证件号等无关个人敏感信息。
+- 与当前服务工单无关的消费者历史数据。
+- 未授权的内部私有文档、未发布规则和跨团队敏感资料。
+- 支付凭证、风控命中细节和商家内部处罚策略。
+
+允许传入 AI 的内容：
+
+- 当前 `ServiceCase` 的脱敏摘要。
+- 与当前工单直接相关的订单、物流、售后和商家上下文。
+- 已发布且适用于当前地区和语言的知识库片段。
+- 经过脱敏的历史沟通摘要。
+
+### 最小权限原则
+
+- AI 服务使用独立服务账号，不复用管理员或开发者账号。
+- 服务账号只具备读取必要上下文字段和写入 AI 交互记录的权限。
+- 知识库检索按地区、语言、生效状态和可见范围过滤。
+- BFF 层负责权限判断，AI 层不直接访问生产数据库。
+- 高风险动作如退款、赔付、售后关闭、商家处罚必须走人工确认和业务系统原有权限校验。
+
+### 权限模型
+
+系统采用 RBAC + Resource Scope + Field-level Masking。
+
+- RBAC 决定角色能执行哪些动作。
+- Resource Scope 决定角色能访问哪些工单、队列、商家、地区和知识域。
+- Field-level Masking 决定字段以明文、脱敏、摘要或省略的形式返回。
+
+角色矩阵：
+
+| 角色 | 可访问资源 | 可见字段 | 可执行动作 |
+| --- | --- | --- | --- |
+| `Agent` 平台客服 | 自己负责的 case、所在队列 case | 消费者必要联系信息脱敏展示，订单、物流、售后必要字段 | 查看、回复、采纳或编辑 AI 草稿、升级 case |
+| `Supervisor` 客服主管 | 团队 case、高风险 case、升级 case | 比 Agent 更多，但敏感字段仍按需展示 | 复核回复、调整风险、关闭或重开 case、分配客服 |
+| `MerchantOperator` 商家运营 | 本商家相关 case 的脱敏视图 | 不看完整消费者 PII，只看问题摘要、商品、售后原因和商家处理要求 | 查看归因、处理商家侧待办、维护商品 FAQ 草稿 |
+| `PlatformOperator` 平台运营 | 跨商家、跨地区聚合数据、知识库缺口、规则问题 | 默认看聚合和脱敏数据，不看完整会话 PII | 查看趋势、维护知识库、调整规则说明 |
+| `Admin` 系统管理员 | 系统配置、权限配置、模型和 Prompt 配置 | 不默认拥有业务明文数据查看权 | 管理账号、配置、开关和审计策略 |
+| `AIServiceAccount` AI 服务账号 | 当前 case 的脱敏 ContextSnapshot 和授权知识片段 | 只读白名单字段 | 生成 AIInteraction、写审计，不执行业务动作 |
+
+关键约束：
+
+- `MerchantOperator` 不能查看完整消费者 PII。
+- `Admin` 不默认拥有业务明文数据查看权。
+- `AIServiceAccount` 不能绕过 BFF 权限过滤直接读取生产数据库。
+- 所有 BFF 响应必须先通过权限判断和字段脱敏，再返回前端或进入 AI 上下文。
+
+### 字段可见性策略
+
+字段可见性分为五级：
+
+- `clear`：返回原始明文字段。
+- `masked`：返回部分脱敏字段。
+- `summary`：返回自然语言摘要，不返回原始值。
+- `aggregate`：只返回聚合或分组结果。
+- `omitted`：不返回该字段。
+
+示例字段矩阵：
+
+| 字段 | Agent | Supervisor | MerchantOperator | PlatformOperator | Admin | AIServiceAccount |
+| --- | --- | --- | --- | --- | --- | --- |
+| `consumer.name` | masked | masked | omitted 或别名 | aggregate | omitted | 别名 |
+| `consumer.email` | masked | masked | omitted | omitted | omitted | omitted |
+| `consumer.phone` | masked | masked 或按需 clear | omitted | omitted | omitted | omitted |
+| `shippingAddress` | 国家/地区和粗粒度城市 | masked 或按需 clear | omitted | aggregate | omitted | 国家/地区 |
+| `consumer.country` | clear | clear | clear | clear | clear | clear |
+| `order.amount` | clear 或区间 | clear | 本商家订单 clear | aggregate 或区间 | omitted | 区间或必要字段 |
+| `complaintText` | clear 必要内容 | clear 必要内容 | summary | aggregate summary | omitted | 脱敏 summary |
+| `internalRiskDetail` | omitted | masked | omitted | aggregate | omitted | omitted |
+
+脱敏原则：
+
+- 默认不向商家运营、平台运营、管理员和 AI 服务账号暴露完整消费者 PII。
+- `Supervisor` 的明文查看应按需触发，并写入审计。
+- `AIServiceAccount` 优先使用 summary、masked 和 aggregate 数据。
+- 字段脱敏发生在 BFF 或服务端聚合层，不能依赖前端隐藏字段。
+
+明文查看轻量审计要求：
+
+- 第一阶段不实现明文字段查看能力。
+- 后续如支持主管查看更完整字段，必须记录 `actorId`、`serviceCaseId`、`fieldNames`、`reason` 和 `createdAt`。
+- 明文查看需要用户输入业务原因，例如客户身份核验、升级投诉处理或监管请求。
+- 禁止批量导出消费者 PII。
+- `Admin` 不默认拥有业务明文字段查看权，也不能绕过业务角色直接查看消费者隐私。
+
+### 受控运行环境
+
+- 第一阶段只使用 mock 数据，不接触真实客户数据。
+- 后续接入真实系统时，开发、测试、预发和生产环境隔离。
+- 非生产环境使用脱敏数据或合成数据。
+- 模型调用日志不得记录原始敏感字段。
+- Prompt、模型版本和知识库版本需要可追踪。
 
 ### 输出安全
 
@@ -681,6 +774,20 @@ AI 负反馈率 = reported_inaccurate / viewed AI suggestions
 - 涉及退款、赔付、售后关闭、时效承诺时展示人工确认提示。
 - AI 无法判断时返回人工处理建议。
 - 安全校验失败的草稿不进入客服可发送状态。
+- AI 输出不得绕过平台规则、权限系统或人工审批流程。
+- AI 输出不得生成未被知识引用支持的补偿金额、退款结果或确定送达时间。
+
+### 跨境与隐私合规
+
+天猫海外场景涉及消费者隐私、订单履约、售后责任和跨境数据处理，AI coding 和 AI 业务调用都需要遵守公司数据分级与合规政策。
+
+合规要求：
+
+- 消费者个人信息默认脱敏，只有业务必要字段进入模型上下文。
+- 跨境数据访问遵守地区合规要求和公司内部审批流程。
+- AI 不应把某一地区的规则错误应用到另一地区。
+- 历史 AI 结果保留当时引用的知识版本，不能被后续规则更新静默改写。
+- 删除、导出、纠错等数据主体权利相关能力应由原业务系统负责，AI 只能辅助识别和解释。
 
 ### 审计
 
@@ -695,10 +802,231 @@ AI 负反馈率 = reported_inaccurate / viewed AI suggestions
 - 风险等级变更事件。
 - 操作时间。
 - 操作人。
+- 权限拒绝、AI 安全拦截、schema 校验失败和模型调用失败。
 
-## 17. 测试策略
+## 17. 工程变更与代码审查机制
 
-### 第一阶段
+### 变更管理
+
+每个功能变更应对应一个可追踪工作项。
+
+推荐链路：
+
+```txt
+Feature Spec / Issue -> Implementation Branch -> Pull Request -> Review -> CI -> Merge
+```
+
+每个 PR 需要说明：
+
+- 业务背景：为什么需要这个变更。
+- 变更范围：改了哪些模块和数据流。
+- 风险点：是否涉及权限、数据、AI 输出、安全或迁移。
+- 验证结果：贴出 lint、typecheck、test、build 的结果。
+- 回滚方式：如何关闭功能、回退配置或恢复旧行为。
+
+### 强制代码审查范围
+
+AI 生成代码不能直接合并。以下变更必须由人工 review：
+
+- 鉴权和权限判断。
+- 支付、退款、赔付和售后关闭。
+- 数据删除、数据导出和隐私相关逻辑。
+- 数据库迁移脚本。
+- AI prompt、安全策略和输出过滤规则。
+- 缓存 key、幂等 key、队列重试策略。
+- BFF 聚合权限和敏感字段脱敏。
+- 生产配置、密钥管理和环境变量。
+
+### Review 关注点
+
+代码审查需要检查：
+
+- 是否遵守最小权限原则。
+- 是否泄露消费者、订单、商家或内部知识库敏感数据。
+- 是否存在越权访问、IDOR 或未校验的 `caseId` / `orderId`。
+- AI 输出是否经过 schema 校验和安全过滤。
+- 高风险动作是否仍由人工确认和原业务系统执行。
+- 数据库查询是否有分页、索引和范围限制。
+- 是否有可回滚方案。
+
+## 18. CI/CD 与自动化验证
+
+### 测试工程技术选型
+
+推荐测试栈：
+
+| 测试层级 | 技术选型 | 作用 |
+| --- | --- | --- |
+| 类型检查 | `tsc --noEmit` | 验证 TypeScript 类型正确性，提前发现模型字段和组件 props 不一致 |
+| 代码规范 | ESLint | 维持代码规范，作为最基础 CI 门禁 |
+| 单元测试 | Vitest | 测试业务函数、风险规则、AI 输出结构、指标计算和 stale 判断 |
+| 组件测试 | React Testing Library | 测试工单列表、详情区、AI 面板等组件的用户可见行为 |
+| API/BFF 测试 | Vitest + MSW | 模拟后端接口，验证 BFF 聚合、权限过滤和错误降级 |
+| Mock API | MSW | 在测试和本地开发中模拟 API，避免依赖真实后端 |
+| E2E 测试 | Playwright | 覆盖客服工作台主流程和跨浏览器真实交互 |
+| 覆盖率 | Vitest Coverage / V8 | 统计核心业务逻辑覆盖率，不追求 UI 代码全覆盖 |
+| CI | GitHub Actions | 执行 typecheck、lint、test、build 和 e2e 门禁 |
+
+分阶段接入建议：
+
+- 第一阶段：使用 `tsc --noEmit`、ESLint 和 `next build` 作为最低门禁。
+- 第二阶段：接入 Vitest、React Testing Library 和 MSW，覆盖业务函数与核心组件。
+- 第三阶段：接入 Playwright 和 GitHub Actions，覆盖完整客服工作台流程。
+- 第四阶段：补充 coverage、权限边界测试、脱敏测试和 AI schema 校验测试。
+
+选型理由：
+
+- Vitest 与 TypeScript 和 Vite 生态兼容度高，执行速度快，适合测试 `lib/` 中的业务逻辑。
+- React Testing Library 鼓励从用户行为验证组件，适合测试工单切换和 AI 面板展示。
+- MSW 可以在不启动真实后端的情况下模拟 BFF/API 响应，适合 mock-first 到 API-first 的演进。
+- Playwright 覆盖真实浏览器交互，适合验证简历 Demo 的核心用户路径。
+- GitHub Actions 对开源和个人项目友好，便于在简历项目中展示工程完整度。
+
+### Next.js 16 / React 19 兼容性边界
+
+当前项目使用 Next.js 16 和 React 19。测试工具接入前需要阅读当前版本的 `node_modules/next/dist/docs/` 相关文档，避免沿用旧版 Next.js 测试方式。
+
+测试边界：
+
+- Vitest 主要用于纯 TypeScript 业务逻辑、工具函数、指标计算、风险规则和 AI 输出结构校验。
+- React Testing Library 主要用于客户端组件和用户可见行为，不强行覆盖所有 Server Component 细节。
+- Next.js Server Component、Route Handler、缓存行为和页面级数据流优先通过集成测试或 Playwright 验证。
+- MSW 用于模拟 BFF/API 响应，避免组件测试和集成测试依赖真实后端。
+- Playwright 用于验证真实浏览器中的首页工作台主流程，是页面级行为的最终兜底。
+- Next.js 或 React 大版本升级前，需要重新检查测试工具兼容性和官方 testing 文档。
+
+不推荐的做法：
+
+- 不用组件单测强行模拟复杂 Server Component 内部实现。
+- 不把 MSW 当成真实权限系统或真实数据库的替代品。
+- 不用 E2E 覆盖所有边界分支，E2E 只保留核心用户路径。
+- 不在没有版本验证的情况下照搬旧版 Next.js 测试配置。
+
+### 第一阶段本地验证
+
+第一阶段至少执行：
+
+```bash
+npm run lint
+npm run build
+```
+
+建议补充脚本：
+
+```bash
+npm run typecheck
+npm run test
+npm run test:coverage
+npm run test:e2e
+```
+
+如果项目还没有测试框架，第一阶段可以先用 `lint` 和 `build` 作为最低门禁，并在后续接入 Vitest、React Testing Library 和 Playwright。
+
+### 后续 CI 门禁
+
+推荐 CI pipeline：
+
+```txt
+install -> typecheck -> lint -> unit test -> integration test -> e2e test -> build
+```
+
+建议脚本：
+
+```json
+{
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:component": "vitest run tests/components",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "playwright test",
+    "build": "next build"
+  }
+}
+```
+
+### 自动化测试覆盖
+
+单元测试：
+
+- `buildAiAssistantResult()` 输出结构。
+- 风险等级冲突规则。
+- stale AIInteraction 判断。
+- AI 采纳率指标计算。
+- 知识引用版本匹配。
+
+集成测试：
+
+- BFF 根据 `caseId` 聚合工单、会话、订单、物流、售后、商家和 AI 结果。
+- 无权限用户不能读取不属于自己的工单上下文。
+- AI 生成任务使用正确幂等 key。
+- 知识库更新后旧 AIInteraction 被标记 stale。
+
+E2E 测试：
+
+- 首页不是默认模板。
+- 工单可以切换。
+- 不同工单展示不同上下文。
+- AI 面板内容随工单变化。
+- 高风险工单显示主管复核提示。
+- AI 草稿采纳、编辑、忽略操作可见。
+
+安全测试：
+
+- 模型上下文不包含原始手机号、邮箱、地址和密钥。
+- BFF 不返回未授权字段。
+- AI 输出无法绕过人工确认触发退款或赔付。
+- 生产密钥不会出现在日志、前端 bundle 或 AI 输入中。
+
+### 推荐测试目录
+
+后续接入测试框架后，建议使用以下目录：
+
+```txt
+tests/
+  unit/
+    ai-assistant.test.ts
+    risk-assessment.test.ts
+    metrics.test.ts
+  components/
+    CaseList.test.tsx
+    CaseDetail.test.tsx
+    AiAssistantPanel.test.tsx
+  integration/
+    case-workbench-bff.test.ts
+    ai-interaction-stale.test.ts
+    permission-boundary.test.ts
+  e2e/
+    service-workbench.spec.ts
+  fixtures/
+    service-cases.ts
+    knowledge-citations.ts
+```
+
+测试命名原则：
+
+- `unit` 测纯业务函数，不依赖浏览器。
+- `components` 测用户可见行为，不测组件内部实现。
+- `integration` 测 BFF、权限、AIInteraction 和数据聚合边界。
+- `e2e` 只覆盖最关键用户路径，避免过多脆弱用例。
+- `fixtures` 复用 mock 工单、知识引用和 AI 输出样本。
+
+### 部署门禁
+
+生产部署前必须满足：
+
+- CI 全部通过。
+- 高风险变更完成代码审查。
+- 数据库迁移有回滚或兼容方案。
+- AI prompt 或安全策略变更记录版本。
+- 必要时提供灰度、开关或回滚配置。
+
+## 19. 测试策略
+
+### 第一阶段人工验证
 
 验证命令：
 
@@ -715,7 +1043,7 @@ npm run build
 - AI 面板内容随工单变化。
 - 页面在桌面视口下无重叠。
 
-### 后续阶段
+### 后续阶段测试项
 
 可增加：
 
@@ -727,15 +1055,24 @@ npm run build
 - AIInteraction stale 判断测试。
 - 关键查询性能测试。
 
-## 18. ADR
+## 20. ADR
 
 本技术设计已沉淀以下架构决策：
 
 - [ADR 0001: Generate AI Suggestions Asynchronously](../docs/adr/0001-async-ai-suggestion-generation.md)
 - [ADR 0002: Persist AI Interactions Instead of Treating Cached AI Output as Truth](../docs/adr/0002-persist-ai-interactions-instead-of-caching-as-truth.md)
 - [ADR 0003: Capacity Assumptions for the Service Workbench](../docs/adr/0003-capacity-assumptions-for-service-workbench.md)
+- [ADR 0004: Use RBAC with Resource Scope and Field-Level Masking](../docs/adr/0004-rbac-resource-scope-field-masking.md)
 
-## 19. 简历技术表述
+后续建议补充 ADR：
+
+- 数据库选型：PostgreSQL 或 MySQL 的选择依据。
+- 权限模型：客服、主管、商家运营和平台运营的数据边界。
+- 队列方案：AI 生成任务、重试和死信策略。
+- 缓存策略：哪些数据可以缓存、TTL 和失效条件。
+- 知识检索方案：向量库、版本管理和地区语言过滤。
+
+## 21. 简历技术表述
 
 推荐项目描述：
 

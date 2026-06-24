@@ -859,6 +859,9 @@ AI 生成代码不能直接合并。以下变更必须由人工 review：
 | --- | --- | --- |
 | 类型检查 | `tsc --noEmit` | 验证 TypeScript 类型正确性，提前发现模型字段和组件 props 不一致 |
 | 代码规范 | ESLint | 维持代码规范，作为最基础 CI 门禁 |
+| Git Hooks | Husky | 在提交前执行本地质量检查，避免明显问题进入 PR |
+| Staged 文件检查 | lint-staged | 只检查本次提交涉及的文件，降低本地 hook 耗时 |
+| Commit 规范 | commitlint | 约束 commit message，便于生成 changelog 和追踪变更 |
 | 单元测试 | Vitest | 测试业务函数、风险规则、AI 输出结构、指标计算和 stale 判断 |
 | 组件测试 | React Testing Library | 测试工单列表、详情区、AI 面板等组件的用户可见行为 |
 | API/BFF 测试 | Vitest + MSW | 模拟后端接口，验证 BFF 聚合、权限过滤和错误降级 |
@@ -870,16 +873,19 @@ AI 生成代码不能直接合并。以下变更必须由人工 review：
 分阶段接入建议：
 
 - 第一阶段：使用 `tsc --noEmit`、ESLint 和 `next build` 作为最低门禁。
-- 第二阶段：接入 Vitest、React Testing Library 和 MSW，覆盖业务函数与核心组件。
-- 第三阶段：接入 Playwright 和 GitHub Actions，覆盖完整客服工作台流程。
-- 第四阶段：补充 coverage、权限边界测试、脱敏测试和 AI schema 校验测试。
+- 第二阶段：接入 Husky、lint-staged 和 commitlint，建立本地提交前质量门禁。
+- 第三阶段：接入 Vitest、React Testing Library 和 MSW，覆盖业务函数与核心组件。
+- 第四阶段：接入 Playwright 和 GitHub Actions，覆盖完整客服工作台流程。
+- 第五阶段：补充 coverage、权限边界测试、脱敏测试和 AI schema 校验测试。
 
 选型理由：
 
 - Vitest 与 TypeScript 和 Vite 生态兼容度高，执行速度快，适合测试 `lib/` 中的业务逻辑。
 - React Testing Library 鼓励从用户行为验证组件，适合测试工单切换和 AI 面板展示。
 - MSW 可以在不启动真实后端的情况下模拟 BFF/API 响应，适合 mock-first 到 API-first 的演进。
-- Playwright 覆盖真实浏览器交互，适合验证简历 Demo 的核心用户路径。
+- Playwright 覆盖真实浏览器交互，适合验证端到端业务流程和关键回归场景。
+- Husky 和 lint-staged 可以把明显格式、lint 和类型问题挡在提交前，减少无效 PR。
+- commitlint 可以让变更历史保持一致，适合配合 issue、PR 和 ADR 追踪工程决策。
 - GitHub Actions 对开源和个人项目友好，便于在简历项目中展示工程完整度。
 
 ### Next.js 16 / React 19 兼容性边界
@@ -921,6 +927,67 @@ npm run test:e2e
 ```
 
 如果项目还没有测试框架，第一阶段可以先用 `lint` 和 `build` 作为最低门禁，并在后续接入 Vitest、React Testing Library 和 Playwright。
+
+### 提交前代码规范门禁
+
+建议使用 Husky + lint-staged + commitlint。
+
+推荐本地 hook：
+
+- `pre-commit`：运行 lint-staged，只检查 staged 文件。
+- `commit-msg`：运行 commitlint，校验 commit message。
+- 高成本命令如完整 E2E、完整 build 不放入 pre-commit，避免提交体验过慢。
+
+建议 lint-staged 策略：
+
+- `*.{ts,tsx,js,jsx}`：运行 ESLint 自动修复。
+- `*.{md,json,css}`：后续接入 Prettier 时运行格式化。
+- 类型检查可以放在 pre-push 或 CI，不建议对每次 staged 文件提交都运行全量 `tsc`。
+
+建议 commit message 规范：
+
+```txt
+feat: add ai assistant panel
+fix: correct stale ai interaction check
+docs: update technical design
+test: add risk assessment unit tests
+chore: configure husky hooks
+```
+
+推荐脚本：
+
+```json
+{
+  "scripts": {
+    "prepare": "husky",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:component": "vitest run tests/components",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "playwright test",
+    "build": "next build"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx}": "eslint --fix",
+    "*.{md,json,css}": "prettier --write"
+  }
+}
+```
+
+推荐 hook 内容：
+
+```bash
+# .husky/pre-commit
+npx lint-staged
+```
+
+```bash
+# .husky/commit-msg
+npx commitlint --edit "$1"
+```
 
 ### 后续 CI 门禁
 
